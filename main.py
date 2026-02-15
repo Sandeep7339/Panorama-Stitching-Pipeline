@@ -1,11 +1,15 @@
 import cv2
+import os
+import sys
+import numpy as np
 import matplotlib.pyplot as plt
 from features import FeatureExtractor
 from homography import HomographyEstimator
 from blending import ImageBlender
 
 def show_image(title, img):
-    """Helper to display images using Matplotlib (better for notebooks/scripts)"""
+    """Displays image in RGB for Matplotlib compatibility."""
+    if img is None: return
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     plt.figure(figsize=(10, 5))
     plt.imshow(img_rgb)
@@ -13,95 +17,99 @@ def show_image(title, img):
     plt.axis('off')
     plt.show()
 
-def stitch_two_images(img1, img2, fe, he, ib):
+def crop_panorama(img):
     """
-    Stitches img1 (Left) onto img2 (Right/Reference).
-    Returns the stitched image.
+    Handles irregular borders by finding the largest internal rectangular area.
+    This removes the black 'wedges' seen in warped results.
     """
-    print("--- Stitching Pair ---")
-    
-    # 1. Feature Extraction
-    print("Detecting Features...")
-    kp1, des1 = fe.detect_and_describe(img1)
-    kp2, des2 = fe.detect_and_describe(img2)
-    
-    # 2. Feature Matching
-    print("Matching Features...")
-    matches = fe.match_features(des1, des2)
-    print(f"Found {len(matches)} good matches.")
-    
-    # 3. Geometric Transformation (Homography)
-    print("Estimating Homography...")
-    H, mask = he.estimate_homography(kp1, kp2, matches)
-    
-    if H is None:
-        print("Stitching failed: Could not estimate Homography.")
-        return None
+    # Create a binary mask of the non-black pixels
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
 
-    # 4. Warping
-    print("Warping Images...")
-    warped_left, panorama_ref, _ = ib.warp_images(img1, img2, H)
+    # Find the largest contour
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img
     
-    # 5. Blending (Artifact Mitigation)
-    print("Blending...")
-    result = ib.seamless_blend(warped_left, panorama_ref)
+    cnt = max(contours, key=cv2.contourArea)
     
-    return result
+    # Get initial bounding box
+    x, y, w, h = cv2.boundingRect(cnt)
+    
+    # Iteratively shrink the rectangle until no black pixels remain inside
+    while cv2.countNonZero(thresh[y:y+h, x:x+w]) < (w * h):
+        x += 1
+        y += 1
+        w -= 2
+        h -= 2
+        if w <= 0 or h <= 0:
+            break
+
+    return img[y:y+h, x:x+w]
 
 def main():
-    # Initialize classes
     fe = FeatureExtractor()
     he = HomographyEstimator()
     ib = ImageBlender()
 
-    # Load Images
-    # Ensure you put the correct filenames here
-    img_left = cv2.imread('img_left.jpeg')
-    img_center = cv2.imread('img_center.jpeg')
-    img_right = cv2.imread('img_right.jpeg')
+    # Configuration ( filenames from your previous code)
+    img_names = ['img_left.jpeg', 'img_center.jpeg', 'img_right.jpeg']
+    images = []
 
-    # Resize images slightly to speed up processing (optional but recommended for huge phone photos)
-    scale_percent = 50 
-    width = int(img_left.shape[1] * scale_percent / 100)
-    height = int(img_left.shape[0] * scale_percent / 100)
-    dim = (width, height)
-    
-    img_left = cv2.resize(img_left, dim)
-    img_center = cv2.resize(img_center, dim)
-    img_right = cv2.resize(img_right, dim)
+    for name in img_names:
+        img = cv2.imread(name)
+        if img is None:
+            print(f"Error: Could not load {name}")
+            sys.exit(1)
+        # Resize to 50% for speed
+        h, w = img.shape[:2]
+        images.append(cv2.resize(img, (int(w * 0.5), int(h * 0.5))))
 
-    print("Images loaded and resized.")
+    img_left, img_center, img_right = images
 
-    # --- Iterative Processing ---
-    # Strategy: 
-    # 1. Stitch Left Image -> Center Image to create "Left_Center_Panorama"
-    # 2. Stitch "Left_Center_Panorama" -> Right Image? 
-    #    Actually, it's better to Stitch Right -> Left_Center_Panorama.
-    #    The result of (1) becomes the new "Reference".
+    # --- STAGE 1: Left -> Center ---
+    print("=== Processing Stage 1: Left -> Center ===")
+    kp_l, des_l = fe.detect_and_describe(img_left)
+    kp_c, des_c = fe.detect_and_describe(img_center)
+    m1 = fe.match_features(des_l, des_c)
+    H1, _ = he.estimate_homography(kp_l, kp_c, m1)
     
-    # Step 1: Stitch Left to Center
-    pan_stage_1 = stitch_two_images(img_left, img_center, fe, he, ib)
+    if H1 is None: return
+
+    warped_l, ref_c, _ = ib.warp_images(img_left, img_center, H1)
+    pan_stage_1 = ib.seamless_blend(warped_l, ref_c)
+
+    # --- STAGE 2: Right -> Stage 1 Result ---
+    print("=== Processing Stage 2: Right -> Stage 1 Result ===")
+    kp_r, des_r = fe.detect_and_describe(img_right)
+    kp_p1, des_p1 = fe.detect_and_describe(pan_stage_1)
+    m2 = fe.match_features(des_r, des_p1)
+    H2, _ = he.estimate_homography(kp_r, kp_p1, m2)
     
-    if pan_stage_1 is not None:
-        # Step 2: Stitch Right to the result of Step 1
-        # Note: The result of stage 1 is now the "Left" side relative to the "Right" image.
-        # However, purely geometrically, we want to map the Right image onto the Stage 1 Panorama.
-        # So we treat Right as "img1" (source) and Stage 1 as "img2" (destination/ref).
+    if H2 is not None:
+        warped_r, pan_ref, _ = ib.warp_images(img_right, pan_stage_1, H2)
         
-        final_panorama = stitch_two_images(img_right, pan_stage_1, fe, he, ib)
+        # --- A. NAIVE STITCH (NO CROPPING) ---
+        print("Generating Naive Stitch (Raw)...")
+        mask = np.any(warped_r != [0, 0, 0], axis=-1)
+        naive_raw = pan_ref.copy()
+        naive_raw[mask] = warped_r[mask]
         
-        if final_panorama is not None:
-            # Final Cleanup
-            final_panorama = ib.crop_black_borders(final_panorama)
-            
-            # Save and Show
-            cv2.imwrite('final_panorama.jpg', final_panorama)
-            show_image("Final Panorama", final_panorama)
-            print("Panorama stitching complete. Saved as 'final_panorama.jpg'")
-        else:
-            print("Second stage stitching failed.")
+        cv2.imwrite('naive_stitch_raw.jpg', naive_raw)
+
+        # --- B. FINAL SEAMLESS STITCH (WITH REFINED CROPPING) ---
+        print("Generating Seamless Stitch...")
+        final_raw = ib.seamless_blend(warped_r, pan_ref)
+        
+        print("Cropping Final Stitch to remove irregular borders...")
+        final_cropped = crop_panorama(final_raw)
+        cv2.imwrite('final_panorama_cropped.jpg', final_cropped)
+        
+        print("Done!")
+        show_image("Naive Stitch (Raw)", naive_raw)
+        show_image("Final Result (Cropped)", final_cropped)
     else:
-        print("First stage stitching failed.")
+        print("Stage 2 Homography failed.")
 
 if __name__ == "__main__":
     main()
